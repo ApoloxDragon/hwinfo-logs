@@ -146,6 +146,8 @@ def _align_groups(group_row: list[str], ncols: int) -> list[str]:
             merged[-1] += "," + cell
         else:
             merged.append(cell)
+    while len(merged) > ncols and merged[-1] == "":  # trailing empty cell(s) past the last sensor
+        merged.pop()
     if len(merged) != ncols:  # cannot trust alignment
         return [""] * ncols
     return merged

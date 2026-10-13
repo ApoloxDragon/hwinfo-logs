@@ -50,6 +50,7 @@ class HwlogTests(unittest.TestCase):
         self.assertIn("Throttle [Yes/No]", out)
         self.assertNotIn("Intrusion", out)  # constant Yes is not an event
         self.assertIn("temp>=90", out)
+        self.assertEqual(out.count("Throttle"), 1)  # aggregated per sensor
 
     def test_stats_and_select(self):
         out = self.run_cli("stats", self.path, "-c", "Tctl")

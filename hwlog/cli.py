@@ -169,7 +169,17 @@ def cmd_summary(args):
     names += hot[:EXTRA_HOTTEST]
     st, text = stats_table(log, names)
     ev = find_events(log, args)
-    out(args, {"stats": st, "events": ev}, f"{head}\n{text}\n\n{render_events(ev)}")
+    out(args, {"stats": st, "events": ev}, f"{head}\n{text}\n\n{render_events(ev, 12)}")
+
+
+def _aggregate(kind, col, eps):
+    """Collapse a sensor's episodes into one row: count, total/longest duration, first start, peak."""
+    row = {"kind": kind, "column": col.name, "episodes": len(eps), "total_s": sum(b - a for a, b, _, _ in eps),
+           "longest_s": max(b - a for a, b, _, _ in eps), "first": fmt_t(eps[0][0], True)}
+    if not col.is_flag:  # a flag's "peak" is always 1
+        peak = max(eps, key=lambda e: e[2])
+        row.update(peak=peak[2], peak_at=fmt_t(peak[3], True))
+    return row
 
 
 def find_events(log: Log, args) -> list[dict]:
@@ -180,22 +190,26 @@ def find_events(log: Log, args) -> list[dict]:
             on = sum(1 for v in vals if v == 1)
             if on == 0 or on == len(vals):
                 continue  # never set, or constant (e.g. Chassis Intrusion): not an event
-            for a, b, _, _ in episodes(log.times, vals, lambda v: v >= 1):
-                ev.append({"kind": "flag", "column": c.name, "start": fmt_t(a, True), "end": fmt_t(b, True), "dur_s": b - a})
-        elif c.unit == "°C":
+            ev.append(_aggregate("flag", c, episodes(log.times, vals, lambda v: v >= 1)))
+        elif c.unit == "\u00b0C":
             lim = args.temp_limit
-            for a, b, p, pt in episodes(log.times, vals, lambda v: v >= lim):
-                ev.append({"kind": f"temp>={lim:g}", "column": c.name, "start": fmt_t(a, True), "end": fmt_t(b, True), "dur_s": b - a, "peak": p, "peak_at": fmt_t(pt, True)})
+            eps = episodes(log.times, vals, lambda v: v >= lim)
+            if eps:
+                ev.append(_aggregate(f"temp>={lim:g}", c, eps))
+    ev.sort(key=lambda e: -e["total_s"])
     for t, g in interval_stats(log)[1]:
-        ev.append({"kind": "gap", "column": "(sampling)", "start": fmt_t(t, True), "dur_s": g})
+        ev.append({"kind": "gap", "column": "(sampling)", "episodes": 1, "total_s": g, "longest_s": g,
+                   "first": fmt_t(t, True)})
     return ev
 
 
-def render_events(ev: list[dict]) -> str:
+def render_events(ev: list[dict], limit: int = 25) -> str:
     if not ev:
         return "events: none (no flags raised, no temps over limit, no gaps)"
-    rows = [[e["kind"], e["column"], e.get("start", ""), fmt_dur(e["dur_s"]), fmt_v(e["peak"]) if "peak" in e else ""] for e in ev]
-    return "events:\n" + table(rows, ["kind", "column", "start", "dur", "peak"])
+    rows = [[e["kind"], e["column"], str(e["episodes"]), fmt_dur(e["total_s"]), fmt_dur(e["longest_s"]),
+             e["first"], f"{fmt_v(e['peak'])}@{e['peak_at']}" if "peak" in e else ""] for e in ev[:limit]]
+    more = f"\n... {len(ev) - limit} more (use --json or --limit)" if len(ev) > limit else ""
+    return "events (one row per sensor):\n" + table(rows, ["kind", "column", "n", "total", "longest", "first", "peak"]) + more
 
 
 def cmd_events(args):
@@ -204,11 +218,10 @@ def cmd_events(args):
     for spec in args.above or []:
         name, _, thr = spec.rpartition("=")
         for c in log.find([name]):
-            if c.index not in log.data:
-                log = load(args.file, date_order=args.date_order)
-            for a, b, p, pt in episodes(log.times, log.data[c.index], lambda v, t=float(thr): v >= t):
-                ev.append({"kind": f">={thr}", "column": c.name, "start": fmt_t(a, True), "end": fmt_t(b, True), "dur_s": b - a, "peak": p, "peak_at": fmt_t(pt, True)})
-    out(args, ev, render_events(ev))
+            eps = episodes(log.times, log.data[c.index], lambda v, t=float(thr): v >= t)
+            if eps:
+                ev.append(_aggregate(f">={thr}", c, eps))
+    out(args, ev, render_events(ev, args.limit))
 
 
 def cmd_timeline(args):
@@ -291,6 +304,7 @@ def main(argv=None):
     s = add("events", cmd_events, "flags raised, over-temperature episodes, sampling gaps"); s.add_argument("file")
     s.add_argument("--temp-limit", type=float, default=DEFAULT_LIMITS["°C"])
     s.add_argument("--above", action="append", metavar="COLUMN=VALUE", help="extra episodes where a column >= value")
+    s.add_argument("--limit", type=int, default=25, help="max rows to print (default 25)")
     s = add("timeline", cmd_timeline, "time-bucketed avg/max for chosen columns"); s.add_argument("file"); colopts(s, True)
     s.add_argument("-b", "--bucket", type=float, default=60, help="bucket size in seconds (default 60)")
     s.add_argument("--start", help="HH:MM[:SS] or +seconds from log start"); s.add_argument("--end")

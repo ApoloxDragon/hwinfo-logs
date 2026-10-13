@@ -27,3 +27,9 @@ Notes:
 - A flag column that is constant for the whole log (e.g. Chassis Intrusion = Yes) is not reported as an event.
 - Idle sensors (all zero, such as FPS without a game running) are hidden from `summary`.
 - Logs are time-boxed by HWiNFO's logging start, so the filename date is not reliable; trust `info`.
+- Intel "Performance Limit - *" / "* Limit Reasons" flags fire constantly, including at idle (in one laptop log
+  "Performance Limit - Thermal" was on for 59 min at an average 48 C). Never report them as throttling on their own;
+  confirm with `timeline`/`stats` that temperature was actually high (or clocks dropped) while the flag was set.
+- `events` gives one row per sensor (episode count, total/longest duration, first occurrence, peak), not one per toggle.
+- Gaps of minutes in `info` are usually the machine sleeping/suspending, not a logging fault.
+- Limit-style temperature sensors (e.g. "GPU Thermal Limit [C]") are settings, not readings; ignore them in thermal conclusions.
