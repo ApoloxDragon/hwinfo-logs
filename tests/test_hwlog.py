@@ -1,0 +1,67 @@
+import io
+import contextlib
+import os
+import tempfile
+import unittest
+
+from hwlog.cli import main
+from hwlog.parser import load
+
+HEADER = 'Date,Time,"CPU (Tctl/Tdie) [\xb0C]","Fan [RPM]","Fan [RPM]","Throttle [Yes/No]","Intrusion [Yes/No]",\r\n'
+ROWS = [
+    "9.10.2026,23:59:58.000,40.0,1000,2000,No,Yes,\r\n",
+    "10.10.2026,0:0:0.000,95.5,1100,2100,Yes,Yes,\r\n",
+    "10.10.2026,0:0:2.000,96.0,1100,2100,Yes,Yes,\r\n",
+    "10.10.2026,0:0:4.000,50.0,,2100,No,Yes,\r\n",
+]
+FOOTER = HEADER + ",,System: Board,System: Board,System: Board,Drive: X [C:, D:],Drive: X [C:, D:],\r\n"
+
+
+def make(text: str) -> str:
+    fd, path = tempfile.mkstemp(suffix=".CSV")
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(text.encode("cp1252"))
+    return path
+
+
+class HwlogTests(unittest.TestCase):
+    def setUp(self):
+        self.path = make(HEADER + "".join(ROWS) + FOOTER)
+        self.addCleanup(os.remove, self.path)
+
+    def test_parse(self):
+        log = load(self.path)
+        self.assertEqual(log.rows, 4)  # footer not counted as data
+        self.assertEqual([c.name for c in log.columns[3:5]], ["Fan [RPM]", "Fan [RPM]#2"])
+        self.assertEqual(log.columns[2].unit, "\xb0C")
+        self.assertEqual(log.data[5], [0, 1, 1, 0])  # Yes/No -> 1/0
+        self.assertTrue(log.data[3][3] != log.data[3][3])  # empty -> NaN
+        self.assertEqual(log.times[1] - log.times[0], 2.0)  # crosses midnight
+        self.assertEqual(log.columns[5].group, "Drive: X [C:, D:]")  # comma-split group re-merged
+
+    def run_cli(self, *argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(main(list(argv)), 0)
+        return buf.getvalue()
+
+    def test_events(self):
+        out = self.run_cli("events", self.path)
+        self.assertIn("Throttle [Yes/No]", out)
+        self.assertNotIn("Intrusion", out)  # constant Yes is not an event
+        self.assertIn("temp>=90", out)
+
+    def test_stats_and_select(self):
+        out = self.run_cli("stats", self.path, "-c", "Tctl")
+        self.assertIn("96.0", out)
+        self.assertIn("Fan [RPM]#2", self.run_cli("columns", self.path, "-c", "#2"))
+
+    def test_not_hwinfo(self):
+        bad = make("ip,count\n1.2.3.4,5\n")
+        self.addCleanup(os.remove, bad)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["info", bad]), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

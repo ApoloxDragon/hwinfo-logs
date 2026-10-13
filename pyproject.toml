@@ -1,0 +1,16 @@
+[project]
+name = "hwlog"
+version = "0.1.0"
+description = "Fast, LLM-friendly summaries of HWiNFO CSV sensor logs"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+hwlog = "hwlog.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["hwlog"]

@@ -1,0 +1,5 @@
+__pycache__/
+*.egg-info/
+# real sensor logs are large and contain hardware serials; keep them out of git
+samples/
+*.CSV

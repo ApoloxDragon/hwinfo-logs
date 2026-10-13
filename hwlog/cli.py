@@ -1,0 +1,294 @@
+"""hwlog command line: compact, LLM-friendly summaries of HWiNFO CSV logs."""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import statistics
+import sys
+from datetime import datetime, timezone
+
+from .parser import Log, Column, load, percentile
+
+# Columns worth showing by default in `summary` (substring match, first hit wins per entry).
+HIGHLIGHTS = [
+    "Total CPU Usage", "Core Clocks (avg)", "CPU (Tctl/Tdie)", "CPU Package Power", "CPU PPT",
+    "Core Temperatures (avg)", "GPU Temperature", "GPU Utilization", "GPU Memory Junction",
+    "GPU PPT (Sustained)", "GPU Memory Usage", "Physical Memory Load", "Framerate [FPS]",
+    "Frame Time Presented (avg)", "Drive Temperature",
+]
+DEFAULT_LIMITS = {"°C": 90.0}
+
+
+def fmt_t(t: float, short: bool = False) -> str:
+    d = datetime.fromtimestamp(t, tz=timezone.utc)
+    return d.strftime("%H:%M:%S" if short else "%Y-%m-%d %H:%M:%S")
+
+
+def fmt_dur(s: float) -> str:
+    s = int(round(s))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}h{m:02d}m{sec:02d}s" if h else f"{m}m{sec:02d}s" if m else f"{sec}s"
+
+
+def fmt_v(v: float) -> str:
+    if v != v:
+        return "-"
+    if abs(v) >= 1000:
+        return f"{v:.0f}"
+    return f"{v:.1f}" if abs(v) >= 10 else f"{v:.3g}" if v else "0"
+
+
+def table(rows: list[list[str]], header: list[str]) -> str:
+    rows = [header] + rows
+    w = [max(len(r[i]) for r in rows) for i in range(len(header))]
+    lines = ["  ".join(c.ljust(w[i]) if i == 0 else c.rjust(w[i]) for i, c in enumerate(r)) for r in rows]
+    return "\n".join(lines)
+
+
+def out(args, obj, text: str):
+    print(json.dumps(obj, indent=1, default=lambda x: None) if args.json else text)
+
+
+def interval_stats(log: Log):
+    t = log.times
+    d = [b - a for a, b in zip(t, t[1:])]
+    if not d:
+        return 0.0, []
+    med = statistics.median(d)
+    gaps = [(t[i], d[i]) for i in range(len(d)) if d[i] > max(3 * med, med + 5)]
+    return med, gaps
+
+
+def col_stats(log: Log, c: Column) -> dict:
+    vals = log.data[c.index]
+    clean = sorted(v for v in vals if v == v)
+    if not clean:
+        return {"column": c.name, "n": 0}
+    imax = max(range(len(vals)), key=lambda i: vals[i] if vals[i] == vals[i] else -math.inf)
+    return {
+        "column": c.name, "n": len(clean), "min": clean[0], "avg": sum(clean) / len(clean),
+        "p50": percentile(clean, .5), "p95": percentile(clean, .95), "p99": percentile(clean, .99),
+        "max": clean[-1], "max_at": fmt_t(log.times[imax], True),
+    }
+
+
+def stats_table(log: Log, cols: list[Column]) -> tuple[list[dict], str]:
+    st = [col_stats(log, c) for c in cols]
+    rows = [[s["column"], fmt_v(s.get("min", math.nan)), fmt_v(s.get("avg", math.nan)),
+             fmt_v(s.get("p95", math.nan)), fmt_v(s.get("max", math.nan)), s.get("max_at", "-")] for s in st]
+    return st, table(rows, ["column", "min", "avg", "p95", "max", "max@"])
+
+
+def episodes(times, vals, pred, min_gap=5.0):
+    """Contiguous runs where pred(v) is true -> (start, end, peak_value, peak_time)."""
+    res, cur = [], None
+    for t, v in zip(times, vals):
+        if v == v and pred(v):
+            if cur and t - cur[1] <= min_gap:
+                cur[1] = t
+                if (v > cur[2]) if cur[4] else (v < cur[2]):
+                    cur[2], cur[3] = v, t
+            else:
+                if cur:
+                    res.append(cur)
+                cur = [t, t, v, t, True]
+        elif cur and t - cur[1] > min_gap:
+            res.append(cur)
+            cur = None
+    if cur:
+        res.append(cur)
+    return [(a, b, p, pt) for a, b, p, pt, _ in res]
+
+
+# ---- commands -------------------------------------------------------------
+
+def cmd_info(args):
+    for path in args.files:
+        log = load(path, columns=["__none__"], date_order=args.date_order)
+        med, gaps = interval_stats(log)
+        groups: dict[str, int] = {}
+        for c in log.columns[2:]:
+            groups[c.group or "(unknown)"] = groups.get(c.group or "(unknown)", 0) + 1
+        info = {
+            "file": path, "rows": log.rows, "columns": len(log.columns) - 2,
+            "start": fmt_t(log.times[0]) if log.times else None,
+            "end": fmt_t(log.times[-1]) if log.times else None,
+            "duration_s": (log.times[-1] - log.times[0]) if log.times else 0,
+            "interval_s": med, "gaps": [(fmt_t(t, True), g) for t, g in gaps], "groups": groups,
+        }
+        lines = [f"{path}", f"  {info['start']} -> {info['end']}  ({fmt_dur(info['duration_s'])}, {log.rows} rows, ~{med:g}s interval, {info['columns']} sensors)"]
+        if gaps:
+            lines.append("  gaps: " + ", ".join(f"{fmt_t(t, True)} (+{g:.0f}s)" for t, g in gaps[:8]) + (" ..." if len(gaps) > 8 else ""))
+        lines.append("  sensor groups:")
+        lines += [f"    {n:4d}  {g}" for g, n in groups.items()]
+        out(args, info, "\n".join(lines))
+
+
+def cmd_columns(args):
+    log = load(args.file, columns=["__none__"], date_order=args.date_order)
+    cols = log.find(args.column, args.regex)[2 if not args.column else 0:]
+    if args.group:
+        cols = [c for c in cols if args.group.lower() in c.group.lower()]
+    rows = [[str(c.index), c.name, c.unit, c.group] for c in cols]
+    out(args, [vars(c) for c in cols], table(rows, ["idx", "name", "unit", "group"]))
+
+
+def cmd_stats(args):
+    log = load(args.file, columns=args.column, regex=args.regex, date_order=args.date_order)
+    cols = [log.columns[i] for i in log.data]
+    st, text = stats_table(log, cols)
+    out(args, st, f"{args.file}  {fmt_t(log.times[0])} -> {fmt_t(log.times[-1])}\n{text}")
+
+
+def cmd_summary(args):
+    log = load(args.file, date_order=args.date_order)
+    names = []
+    for h in HIGHLIGHTS:
+        hit = log.find([h])
+        names += [c for c in hit[:1]]
+    med, gaps = interval_stats(log)
+    head = f"{args.file}\n{fmt_t(log.times[0])} -> {fmt_t(log.times[-1])}  ({fmt_dur(log.times[-1] - log.times[0])}, {log.rows} rows, ~{med:g}s)"
+    names = [c for c in names if any(v == v and v != 0 for v in log.data[c.index])]  # drop idle (all-zero) sensors
+    st, text = stats_table(log, names)
+    ev = find_events(log, args)
+    out(args, {"stats": st, "events": ev}, f"{head}\n{text}\n\n{render_events(ev)}")
+
+
+def find_events(log: Log, args) -> list[dict]:
+    ev = []
+    for c in log.columns[2:]:
+        vals = log.data[c.index]
+        if c.is_flag:
+            on = sum(1 for v in vals if v == 1)
+            if on == 0 or on == len(vals):
+                continue  # never set, or constant (e.g. Chassis Intrusion): not an event
+            for a, b, _, _ in episodes(log.times, vals, lambda v: v >= 1):
+                ev.append({"kind": "flag", "column": c.name, "start": fmt_t(a, True), "end": fmt_t(b, True), "dur_s": b - a})
+        elif c.unit == "°C":
+            lim = args.temp_limit
+            for a, b, p, pt in episodes(log.times, vals, lambda v: v >= lim):
+                ev.append({"kind": f"temp>={lim:g}", "column": c.name, "start": fmt_t(a, True), "end": fmt_t(b, True), "dur_s": b - a, "peak": p, "peak_at": fmt_t(pt, True)})
+    for t, g in interval_stats(log)[1]:
+        ev.append({"kind": "gap", "column": "(sampling)", "start": fmt_t(t, True), "dur_s": g})
+    return ev
+
+
+def render_events(ev: list[dict]) -> str:
+    if not ev:
+        return "events: none (no flags raised, no temps over limit, no gaps)"
+    rows = [[e["kind"], e["column"], e.get("start", ""), fmt_dur(e["dur_s"]), fmt_v(e["peak"]) if "peak" in e else ""] for e in ev]
+    return "events:\n" + table(rows, ["kind", "column", "start", "dur", "peak"])
+
+
+def cmd_events(args):
+    log = load(args.file, date_order=args.date_order)
+    ev = find_events(log, args)
+    for spec in args.above or []:
+        name, _, thr = spec.rpartition("=")
+        for c in log.find([name]):
+            if c.index not in log.data:
+                log = load(args.file, date_order=args.date_order)
+            for a, b, p, pt in episodes(log.times, log.data[c.index], lambda v, t=float(thr): v >= t):
+                ev.append({"kind": f">={thr}", "column": c.name, "start": fmt_t(a, True), "end": fmt_t(b, True), "dur_s": b - a, "peak": p, "peak_at": fmt_t(pt, True)})
+    out(args, ev, render_events(ev))
+
+
+def cmd_timeline(args):
+    log = load(args.file, columns=args.column, regex=args.regex, date_order=args.date_order)
+    cols = [log.columns[i] for i in log.data]
+    t0 = log.times[0]
+    lo = _parse_offset(args.start, log) if args.start else log.times[0]
+    hi = _parse_offset(args.end, log) if args.end else log.times[-1]
+    b = args.bucket
+    buckets: dict[int, list[int]] = {}
+    for i, t in enumerate(log.times):
+        if lo <= t <= hi:
+            buckets.setdefault(int((t - lo) // b), []).append(i)
+    rows = []
+    for k in sorted(buckets):
+        idx = buckets[k]
+        row = [fmt_t(lo + k * b, True)]
+        for c in cols:
+            v = [log.data[c.index][i] for i in idx if log.data[c.index][i] == log.data[c.index][i]]
+            row.append(f"{fmt_v(sum(v) / len(v))}/{fmt_v(max(v))}" if v and not args.avg else fmt_v(sum(v) / len(v)) if v else "-")
+        rows.append(row)
+    suffix = "" if args.avg else " (avg/max)"
+    header = ["time"] + [c.name for c in cols]
+    out(args, {"header": header, "rows": rows}, f"bucket={b:g}s{suffix}\n" + table(rows, header))
+
+
+def _parse_offset(s: str, log: Log) -> float:
+    """HH:MM[:SS] clock time on the log's first day (rolling over midnight), or +N seconds."""
+    if s.startswith("+"):
+        return log.times[0] + float(s[1:])
+    parts = [float(x) for x in s.split(":")]
+    sec = parts[0] * 3600 + parts[1] * 60 + (parts[2] if len(parts) > 2 else 0)
+    day0 = log.times[0] - log.times[0] % 86400
+    t = day0 + sec
+    return t + 86400 if t < log.times[0] - 1 else t
+
+
+def cmd_compare(args):
+    a = load(args.a, columns=args.column, regex=args.regex, date_order=args.date_order)
+    b = load(args.b, columns=args.column, regex=args.regex, date_order=args.date_order)
+    bmap = {c.name: c for c in b.columns if c.index in b.data}
+    rows, res = [], []
+    for i in a.data:
+        ca = a.columns[i]
+        cb = bmap.get(ca.name)
+        if not cb:
+            continue
+        sa, sb = col_stats(a, ca), col_stats(b, cb)
+        if not sa["n"] or not sb["n"]:
+            continue
+        d = sb["avg"] - sa["avg"]
+        res.append({"column": ca.name, "a": sa, "b": sb, "avg_delta": d})
+        rows.append([ca.name, fmt_v(sa["avg"]), fmt_v(sb["avg"]), f"{d:+.3g}", fmt_v(sa["max"]), fmt_v(sb["max"])])
+    out(args, res, f"A={args.a}\nB={args.b}\n" + table(rows, ["column", "avgA", "avgB", "d(avg)", "maxA", "maxB"]))
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="hwlog", description=__doc__)
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--date-order", choices=["dmy", "mdy", "ymd"], help="override date format autodetection")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, help, files=False):
+        s = sub.add_parser(name, help=help)
+        s.set_defaults(fn=fn)
+        if files:
+            s.add_argument("files", nargs="+")
+        return s
+
+    def colopts(s, required=False):
+        s.add_argument("-c", "--column", action="append", required=required, help="name substring, exact name, or index; repeatable")
+        s.add_argument("--regex", action="store_true", help="treat -c as regular expressions")
+
+    add("info", cmd_info, "overview of one or more logs", files=True)
+    s = add("columns", cmd_columns, "list sensor columns"); s.add_argument("file"); colopts(s)
+    s.add_argument("-g", "--group", help="filter by sensor group substring")
+    s = add("stats", cmd_stats, "min/avg/p95/max for chosen columns"); s.add_argument("file"); colopts(s, True)
+    s = add("summary", cmd_summary, "key sensors plus events in one call"); s.add_argument("file")
+    s.add_argument("--temp-limit", type=float, default=DEFAULT_LIMITS["°C"], help="°C threshold for events (default 90)")
+    s = add("events", cmd_events, "flags raised, over-temperature episodes, sampling gaps"); s.add_argument("file")
+    s.add_argument("--temp-limit", type=float, default=DEFAULT_LIMITS["°C"])
+    s.add_argument("--above", action="append", metavar="COLUMN=VALUE", help="extra episodes where a column >= value")
+    s = add("timeline", cmd_timeline, "time-bucketed avg/max for chosen columns"); s.add_argument("file"); colopts(s, True)
+    s.add_argument("-b", "--bucket", type=float, default=60, help="bucket size in seconds (default 60)")
+    s.add_argument("--start", help="HH:MM[:SS] or +seconds from log start"); s.add_argument("--end")
+    s.add_argument("--avg", action="store_true", help="show only the average")
+    s = add("compare", cmd_compare, "compare column stats of two logs"); s.add_argument("a"); s.add_argument("b"); colopts(s, True)
+
+    args = p.parse_args(argv)
+    try:
+        args.fn(args)
+    except (ValueError, FileNotFoundError) as e:
+        print(f"hwlog: {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
