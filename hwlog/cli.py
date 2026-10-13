@@ -10,13 +10,22 @@ from datetime import datetime, timezone
 
 from .parser import Log, Column, load, percentile
 
-# Columns worth showing by default in `summary` (substring match, first hit wins per entry).
+# Sensors shown by default in `summary`. Each entry lists alternative name substrings
+# (AMD / Intel / NVIDIA / laptop variants); the first alternative that matches a column wins.
 HIGHLIGHTS = [
-    "Total CPU Usage", "Core Clocks (avg)", "CPU (Tctl/Tdie)", "CPU Package Power", "CPU PPT",
-    "Core Temperatures (avg)", "GPU Temperature", "GPU Utilization", "GPU Memory Junction",
-    "GPU PPT (Sustained)", "GPU Memory Usage", "Physical Memory Load", "Framerate [FPS]",
-    "Frame Time Presented (avg)", "Drive Temperature",
+    ("Total CPU Usage",), ("Core Clocks (avg)",),
+    ("CPU (Tctl/Tdie)", "CPU Package [", "CPU Die (average)"),
+    ("CPU Package Power", "CPU PPT"), ("IA Cores Power",),
+    ("Core Temperatures (avg)",),
+    ("GPU Temperature",), ("GPU Hot Spot", "GPU Memory Junction"),
+    ("GPU Utilization", "GPU Core Load", "GPU D3D Usage"),
+    ("GPU PPT (Sustained)", "GPU Power [W]", "GPU Power (Total)", "Total Graphics Power"),
+    ("GPU Clock",), ("GPU Memory Usage", "GPU Memory Allocated"),
+    ("Physical Memory Load",), ("Framerate [FPS]", "Framerate Presented (avg)"),
+    ("Frame Time Presented (avg)",), ("Drive Temperature",),
+    ("Battery", "Charge Level", "Charge Rate"),
 ]
+EXTRA_HOTTEST = 3  # also show the hottest N temperature sensors not already listed
 DEFAULT_LIMITS = {"°C": 90.0}
 
 
@@ -145,12 +154,19 @@ def cmd_stats(args):
 def cmd_summary(args):
     log = load(args.file, date_order=args.date_order)
     names = []
-    for h in HIGHLIGHTS:
-        hit = log.find([h])
-        names += [c for c in hit[:1]]
+    for alts in HIGHLIGHTS:
+        for a in alts:
+            hit = log.find([a])
+            if hit:
+                names.append(hit[0])
+                break
     med, gaps = interval_stats(log)
     head = f"{args.file}\n{fmt_t(log.times[0])} -> {fmt_t(log.times[-1])}  ({fmt_dur(log.times[-1] - log.times[0])}, {log.rows} rows, ~{med:g}s)"
     names = [c for c in names if any(v == v and v != 0 for v in log.data[c.index])]  # drop idle (all-zero) sensors
+    shown = {c.index for c in names}
+    hot = sorted((c for c in log.columns[2:] if c.unit == "\u00b0C" and c.index not in shown),
+                 key=lambda c: -max((v for v in log.data[c.index] if v == v), default=-math.inf))
+    names += hot[:EXTRA_HOTTEST]
     st, text = stats_table(log, names)
     ev = find_events(log, args)
     out(args, {"stats": st, "events": ev}, f"{head}\n{text}\n\n{render_events(ev)}")
