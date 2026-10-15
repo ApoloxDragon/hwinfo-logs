@@ -18,6 +18,10 @@ Workflow:
 6. `hwlog events FILE --temp-limit 85 --above "GPU Utilization=98"` - episodes over a threshold,
    raised Yes/No flags (throttling, WHEA), sampling gaps.
 7. `hwlog compare A B -c Tctl -c "Package Power"` - before/after (e.g. undervolt, cooler swap).
+   Compare two windows of ONE log by omitting B: `hwlog compare FILE --window-a 20:15..21:02 --window-b 21:05..21:13:30 -c ...`
+   (windows are `START..END`, clock times or `+seconds`). Add `--when "GPU Utilization>=90"` to compare only samples at
+   matching load. Before attributing a difference to a setting, check both windows had the same workload (same
+   game/map); otherwise the difference may just be the workload.
 
 Add `--json` (before the subcommand) for machine-readable output.
 

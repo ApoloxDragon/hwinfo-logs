@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import statistics
 import sys
 from datetime import datetime, timezone
@@ -70,12 +71,14 @@ def interval_stats(log: Log):
     return med, gaps
 
 
-def col_stats(log: Log, c: Column) -> dict:
+def col_stats(log: Log, c: Column, rows: list[int] | None = None) -> dict:
+    """Stats for a column, optionally restricted to the given row indexes."""
     vals = log.data[c.index]
-    clean = sorted(v for v in vals if v == v)
+    rows = range(len(vals)) if rows is None else rows
+    clean = sorted(vals[i] for i in rows if vals[i] == vals[i])
     if not clean:
         return {"column": c.name, "n": 0}
-    imax = max(range(len(vals)), key=lambda i: vals[i] if vals[i] == vals[i] else -math.inf)
+    imax = max(rows, key=lambda i: vals[i] if vals[i] == vals[i] else -math.inf)
     return {
         "column": c.name, "n": len(clean), "min": clean[0], "avg": sum(clean) / len(clean),
         "p50": percentile(clean, .5), "p95": percentile(clean, .95), "p99": percentile(clean, .99),
@@ -262,23 +265,60 @@ def _parse_offset(s: str, log: Log) -> float:
     return t + 86400 if t < log.times[0] - 1 else t
 
 
+def parse_window(spec: str, log: Log) -> tuple[float, float]:
+    """'START..END' where each end is HH:MM[:SS] or +seconds from log start; either may be empty."""
+    lo, sep, hi = spec.partition("..")
+    if not sep:
+        raise ValueError(f"window {spec!r} must look like START..END, e.g. 20:15..21:02 or +0..+600")
+    return (_parse_offset(lo, log) if lo else log.times[0], _parse_offset(hi, log) if hi else log.times[-1])
+
+
+def select_rows(log: Log, window: str | None, when: str | None) -> list[int]:
+    lo, hi = parse_window(window, log) if window else (log.times[0], log.times[-1])
+    rows = [i for i, t in enumerate(log.times) if lo <= t <= hi]
+    if when:
+        m = re.match(r"^(.*?)\s*(>=|<=|>|<)\s*(-?[\d.]+)$", when)
+        if not m:
+            raise ValueError(f"--when {when!r} must look like 'GPU Utilization>=90'")
+        cols = log.find([m.group(1)])
+        if not cols:
+            raise ValueError(f"--when: no column matches {m.group(1)!r}")
+        vals, thr, op = log.data[cols[0].index], float(m.group(3)), m.group(2)
+        test = {">=": lambda v: v >= thr, "<=": lambda v: v <= thr, ">": lambda v: v > thr, "<": lambda v: v < thr}[op]
+        rows = [i for i in rows if vals[i] == vals[i] and test(vals[i])]
+    return rows
+
+
 def cmd_compare(args):
-    a = load(args.a, columns=args.column, regex=args.regex, date_order=args.date_order)
-    b = load(args.b, columns=args.column, regex=args.regex, date_order=args.date_order)
+    """Compare two logs, or two time windows of one log (omit B). --window-a/--window-b trim either side;
+    --when keeps only samples where a condition holds (e.g. matching GPU load)."""
+    if not args.b and not (args.window_a and args.window_b):
+        raise ValueError("compare needs a second log, or both --window-a and --window-b to compare windows of one log")
+    cols = (args.column or []) + ([re.match(r"^(.*?)\s*(?:>=|<=|>|<)", args.when).group(1)] if args.when and re.match(r"^(.*?)\s*(?:>=|<=|>|<)", args.when) else [])
+    a = load(args.a, columns=cols, regex=args.regex, date_order=args.date_order)
+    b = load(args.b, columns=cols, regex=args.regex, date_order=args.date_order) if args.b else a
+    ra, rb = select_rows(a, args.window_a, args.when), select_rows(b, args.window_b, args.when)
+    wanted = {c.name for c in a.find(args.column, args.regex)}
     bmap = {c.name: c for c in b.columns if c.index in b.data}
     rows, res = [], []
-    for i in a.data:
-        ca = a.columns[i]
+    for ca in (a.columns[i] for i in a.data):
         cb = bmap.get(ca.name)
-        if not cb:
+        if ca.name not in wanted or not cb:
             continue
-        sa, sb = col_stats(a, ca), col_stats(b, cb)
+        sa, sb = col_stats(a, ca, ra), col_stats(b, cb, rb)
         if not sa["n"] or not sb["n"]:
             continue
         d = sb["avg"] - sa["avg"]
         res.append({"column": ca.name, "a": sa, "b": sb, "avg_delta": d})
         rows.append([ca.name, fmt_v(sa["avg"]), fmt_v(sb["avg"]), f"{d:+.3g}", fmt_v(sa["max"]), fmt_v(sb["max"])])
-    out(args, res, f"A={args.a}\nB={args.b}\n" + table(rows, ["column", "avgA", "avgB", "d(avg)", "maxA", "maxB"]))
+
+    def label(name, log, w, r):
+        span = f"{fmt_t(log.times[r[0]], True)}-{fmt_t(log.times[r[-1]], True)}" if r else "empty"
+        return f"{name}: {args.b if (name == 'B' and args.b) else args.a}  window={w or 'all'}  {len(r)} samples ({span})"
+
+    note = f"\nsamples filtered by: {args.when}" if args.when else ""
+    out(args, res, f"{label('A', a, args.window_a, ra)}\n{label('B', b, args.window_b, rb)}{note}\n"
+        + table(rows, ["column", "avgA", "avgB", "d(avg)", "maxA", "maxB"]))
 
 
 def main(argv=None):
@@ -312,7 +352,10 @@ def main(argv=None):
     s.add_argument("-b", "--bucket", type=float, default=60, help="bucket size in seconds (default 60)")
     s.add_argument("--start", help="HH:MM[:SS] or +seconds from log start"); s.add_argument("--end")
     s.add_argument("--avg", action="store_true", help="show only the average")
-    s = add("compare", cmd_compare, "compare column stats of two logs"); s.add_argument("a"); s.add_argument("b"); colopts(s, True)
+    s = add("compare", cmd_compare, "compare two logs, or two time windows of one log"); s.add_argument("a"); s.add_argument("b", nargs="?", help="second log; omit to compare two windows of A"); colopts(s, True)
+    s.add_argument("--window-a", metavar="START..END", help="restrict A, e.g. 20:15..21:02 or +0..+600")
+    s.add_argument("--window-b", metavar="START..END", help="restrict B (or the second window when B is omitted)")
+    s.add_argument("--when", metavar="COL>=VALUE", help="only samples where a condition holds on each side, e.g. 'GPU Utilization>=90'")
 
     args = p.parse_args(argv)
     try:

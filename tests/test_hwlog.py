@@ -57,6 +57,14 @@ class HwlogTests(unittest.TestCase):
         self.assertIn("96.0", out)
         self.assertIn("Fan [RPM]#2", self.run_cli("columns", self.path, "-c", "#2"))
 
+    def test_compare_windows(self):
+        out = self.run_cli("compare", self.path, "-c", "Tctl", "--window-a", "+0..+2", "--window-b", "+4..+6")
+        self.assertIn("+5.25", out)  # avg 67.75 -> 73.0
+        out = self.run_cli("compare", self.path, "-c", "Tctl", "--window-a", "+0..+6", "--window-b", "+0..+6", "--when", "Tctl>=90")
+        self.assertIn("2 samples", out)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["compare", self.path, "-c", "Tctl"]), 2)  # one log, no windows
+
     def test_not_hwinfo(self):
         bad = make("ip,count\n1.2.3.4,5\n")
         self.addCleanup(os.remove, bad)
