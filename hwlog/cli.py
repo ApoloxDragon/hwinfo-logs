@@ -234,8 +234,7 @@ def cmd_timeline(args):
     log = load(args.file, columns=args.column, regex=args.regex, date_order=args.date_order)
     cols = [log.columns[i] for i in log.data]
     t0 = log.times[0]
-    lo = _parse_offset(args.start, log) if args.start else log.times[0]
-    hi = _parse_offset(args.end, log) if args.end else log.times[-1]
+    lo, hi = parse_window(f"{args.start or ''}..{args.end or ''}", log)
     b = args.bucket
     buckets: dict[int, list[int]] = {}
     for i, t in enumerate(log.times):
@@ -262,7 +261,8 @@ def _parse_offset(s: str, log: Log) -> float:
     sec = parts[0] * 3600 + parts[1] * 60 + (parts[2] if len(parts) > 2 else 0)
     day0 = log.times[0] - log.times[0] % 86400
     t = day0 + sec
-    return t + 86400 if t < log.times[0] - 1 else t
+    # a clock time before the log starts means the next day, but only if the log actually runs that long
+    return t + 86400 if t < log.times[0] and t + 86400 <= log.times[-1] else t
 
 
 def parse_window(spec: str, log: Log) -> tuple[float, float]:
@@ -270,7 +270,9 @@ def parse_window(spec: str, log: Log) -> tuple[float, float]:
     lo, sep, hi = spec.partition("..")
     if not sep:
         raise ValueError(f"window {spec!r} must look like START..END, e.g. 20:15..21:02 or +0..+600")
-    return (_parse_offset(lo, log) if lo else log.times[0], _parse_offset(hi, log) if hi else log.times[-1])
+    start = _parse_offset(lo, log) if lo else log.times[0]
+    end = _parse_offset(hi, log) if hi else log.times[-1]
+    return start, end + 86400 if end < start else end  # an end clock time before the start is the next day
 
 
 def select_rows(log: Log, window: str | None, when: str | None) -> list[int]:

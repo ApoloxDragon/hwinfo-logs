@@ -65,6 +65,14 @@ class HwlogTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(main(["compare", self.path, "-c", "Tctl"]), 2)  # one log, no windows
 
+    def test_clock_window_edges(self):
+        # first sample is 23:59:58; a start just before it must not roll over to the next day
+        out = self.run_cli("timeline", self.path, "-c", "Tctl", "--start", "23:59:00", "--end", "23:59:59")
+        self.assertIn("40", out)
+        # a clock time after midnight means the next day
+        out = self.run_cli("timeline", self.path, "-c", "Tctl", "--start", "00:00:02", "--end", "00:00:05", "-b", "10")
+        self.assertIn("73", out)  # samples at 0:0:2 (96) and 0:0:4 (50)
+
     def test_not_hwinfo(self):
         bad = make("ip,count\n1.2.3.4,5\n")
         self.addCleanup(os.remove, bad)
