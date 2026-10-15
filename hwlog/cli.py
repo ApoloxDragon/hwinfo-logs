@@ -114,12 +114,57 @@ def episodes(times, vals, pred, min_gap=5.0):
     return [(a, b, p, pt) for a, b, p, pt, _ in res]
 
 
+# ---- diagnostics ------------------------------------------------------------
+
+NON_GAME_PROCESSES = {"dwm.exe", "explorer.exe", "steamwebhelper.exe", "msedge.exe", "chrome.exe", "firefox.exe"}
+FPS_COLUMNS = ["Framerate [FPS]", "Framerate Presented (avg)"]
+GPU_LOAD_COLUMNS = ["GPU Utilization", "GPU Core Load", "GPU D3D Usage"]
+DIAG_COLUMNS = FPS_COLUMNS + GPU_LOAD_COLUMNS
+
+
+def presentmon_target(log: Log) -> str | None:
+    for c in log.columns:
+        m = re.match(r"PresentMon \[(.+)\]", c.group)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _first(log: Log, names: list[str]) -> Column | None:
+    for n in names:
+        hit = [c for c in log.find([n]) if c.index in log.data]
+        if hit:
+            return hit[0]
+    return None
+
+
+def log_warnings(log: Log) -> list[str]:
+    """Problems that make FPS / frame-time numbers misleading. Needs the FPS and GPU load columns loaded."""
+    out = []
+    target = presentmon_target(log)
+    if target and target.lower() in NON_GAME_PROCESSES:
+        out.append(f"PresentMon was tracking {target}, not a game: 1% lows and frame times describe that process, "
+                   "not the game. Select the game's exe in HWiNFO's PresentMon settings before logging.")
+    fps, load = _first(log, FPS_COLUMNS), _first(log, GPU_LOAD_COLUMNS)
+    if fps and load:
+        busy_zero = [1.0 if (f == 0 and l >= 80) else 0.0
+                     for f, l in zip(log.data[fps.index], log.data[load.index])]
+        eps = [e for e in episodes(log.times, busy_zero, lambda v: v >= 1) if e[1] - e[0] >= 30]
+        if eps:
+            total = sum(b - a for a, b, _, _ in eps)
+            out.append(f"{fps.name} read 0 while GPU load was >=80% for {fmt_dur(total)} total "
+                       f"({len(eps)} stretch{'es' if len(eps) > 1 else ''}, first {fmt_t(eps[0][0], True)}-{fmt_t(eps[0][1], True)}): "
+                       "sensor dropout, so FPS/frame-time stats are unreliable there. Temperatures and power are unaffected.")
+    return out
+
+
 # ---- commands -------------------------------------------------------------
 
 def cmd_info(args):
     for path in args.files:
-        log = load(path, columns=["__none__"], date_order=args.date_order)
+        log = load(path, columns=DIAG_COLUMNS, date_order=args.date_order)
         med, gaps = interval_stats(log)
+        warns = log_warnings(log)
         groups: dict[str, int] = {}
         for c in log.columns[2:]:
             groups[c.group or "(unknown)"] = groups.get(c.group or "(unknown)", 0) + 1
@@ -129,6 +174,7 @@ def cmd_info(args):
             "end": fmt_t(log.times[-1]) if log.times else None,
             "duration_s": (log.times[-1] - log.times[0]) if log.times else 0,
             "interval_s": med, "gaps": [(fmt_t(t, True), g) for t, g in gaps], "groups": groups,
+            "presentmon_target": presentmon_target(log), "warnings": warns,
         }
         lines = [f"{path}", f"  {info['start']} -> {info['end']}  ({fmt_dur(info['duration_s'])}, {log.rows} rows, ~{med:g}s interval, {info['columns']} sensors)"]
         if gaps:
@@ -138,6 +184,9 @@ def cmd_info(args):
         else:
             lines.append("  sensor groups:")
             lines += [f"    {n:4d}  {g}" for g, n in groups.items()]
+        if info["presentmon_target"]:
+            lines.append(f"  PresentMon target: {info['presentmon_target']}")
+        lines += [f"  WARNING: {w}" for w in warns]
         out(args, info, "\n".join(lines))
 
 
@@ -175,7 +224,9 @@ def cmd_summary(args):
     names += hot[:EXTRA_HOTTEST]
     st, text = stats_table(log, names)
     ev = find_events(log, args)
-    out(args, {"stats": st, "events": ev}, f"{head}\n{text}\n\n{render_events(ev, 12)}")
+    warns = log_warnings(log)
+    wtext = "".join(f"WARNING: {w}\n" for w in warns)
+    out(args, {"stats": st, "events": ev, "warnings": warns}, f"{head}\n{wtext}{text}\n\n{render_events(ev, 12)}")
 
 
 def _aggregate(kind, col, eps):

@@ -12,4 +12,7 @@ as a skill (see `skill/SKILL.md`) instead of reading 300-column raw rows. Standa
 Handles cp1252 headers, unpadded `d.m.yyyy` dates, duplicate sensor names, the repeated-header
 and sensor-group footer, and `Yes`/`No` flag columns. A 30 MB / 21k-row log loads in about 3 s.
 
+Install: `pip install .` gives an `hwlog` command. The skill lives in `skill/hwinfo-logs/SKILL.md`.
+`info` and `summary` warn when PresentMon tracked a non-game process (e.g. `dwm.exe`) or the FPS sensor read 0 under load.
+
 Tests: `python3 -m unittest discover -s tests -t .`

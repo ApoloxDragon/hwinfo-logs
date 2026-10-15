@@ -3,3 +3,5 @@ __pycache__/
 # real sensor logs are large and contain hardware serials; keep them out of git
 samples/
 *.CSV
+build/
+dist/

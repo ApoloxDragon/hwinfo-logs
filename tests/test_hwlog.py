@@ -73,6 +73,18 @@ class HwlogTests(unittest.TestCase):
         out = self.run_cli("timeline", self.path, "-c", "Tctl", "--start", "00:00:02", "--end", "00:00:05", "-b", "10")
         self.assertIn("73", out)  # samples at 0:0:2 (96) and 0:0:4 (50)
 
+    def test_presentmon_warnings(self):
+        hdr = 'Date,Time,"Framerate [FPS]","GPU Utilization [%]",\r\n'
+        rows = "".join(f"1.1.2026,0:{i // 30}:{(i % 30) * 2},0,95,\r\n" for i in range(60))  # 2 min of FPS=0 under load
+        footer = hdr + ",,PresentMon [dwm.exe],dGPU [#0]: X,\r\n"
+        path = make(hdr + rows + footer)
+        self.addCleanup(os.remove, path)
+        out = self.run_cli("info", path)
+        self.assertIn("PresentMon target: dwm.exe", out)
+        self.assertIn("not a game", out)
+        self.assertIn("read 0 while GPU load", out)
+        self.assertNotIn("WARNING", self.run_cli("info", self.path))  # normal log stays quiet
+
     def test_not_hwinfo(self):
         bad = make("ip,count\n1.2.3.4,5\n")
         self.addCleanup(os.remove, bad)
