@@ -85,6 +85,27 @@ class HwlogTests(unittest.TestCase):
         self.assertIn("read 0 while GPU load", out)
         self.assertNotIn("WARNING", self.run_cli("info", self.path))  # normal log stays quiet
 
+    def test_runs_hist_corr(self):
+        out = self.run_cli("runs", f"a={self.path}@+0..+2", f"b={self.path}@+4..+6", "-c", "Tctl")
+        self.assertIn("a (2)", out)
+        self.assertIn("67.8/95.5", out)
+        self.assertIn("73.0/96.0", out)
+        out = self.run_cli("hist", self.path, "-c", "Tctl", "--edges", "60,90")
+        self.assertIn(">=90", out)
+        self.assertIn("50.0%", out)  # 2 of 4 samples are >= 90
+        out = self.run_cli("corr", self.path, "Tctl", "--all")
+        self.assertIn("Fan [RPM]", out)
+
+    def test_summary_hides_noise(self):
+        hdr = 'Date,Time,"CPU (Tctl/Tdie) [\xb0C]","GPU Thermal Limit [\xb0C]","GPU Memory Usage [MB]",\r\n'
+        rows = "".join(f"1.1.2026,0:0:{i * 2},{40 + i},87,{100000 + i},\r\n" for i in range(10))
+        path = make(hdr + rows)
+        self.addCleanup(os.remove, path)
+        out = self.run_cli("summary", path)
+        self.assertIn("Tctl", out)
+        self.assertNotIn("Thermal Limit", out)
+        self.assertNotIn("Memory Usage", out)
+
     def test_not_hwinfo(self):
         bad = make("ip,count\n1.2.3.4,5\n")
         self.addCleanup(os.remove, bad)

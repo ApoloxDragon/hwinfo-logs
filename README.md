@@ -9,6 +9,10 @@ as a skill (see `skill/SKILL.md`) instead of reading 300-column raw rows. Standa
     python3 -m hwlog compare before.CSV after.CSV -c "Package Power"
     python3 -m hwlog compare log.CSV --window-a 20:15..21:02 --window-b 21:05..21:13 -c "Hot Spot" --when "GPU Utilization>=90"
 
+    python3 -m hwlog runs "60%=a.CSV@22:00..23:10" "90%=b.CSV@20:15..21:02" -c "Hot Spot"
+    python3 -m hwlog hist log.CSV -c "Hot Spot" --edges 70,80,85,90
+    python3 -m hwlog corr log.CSV "GPU Hot Spot Temperature"
+
 Handles cp1252 headers, unpadded `d.m.yyyy` dates, duplicate sensor names, the repeated-header
 and sensor-group footer, and `Yes`/`No` flag columns. A 30 MB / 21k-row log loads in about 3 s.
 

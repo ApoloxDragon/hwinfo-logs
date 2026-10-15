@@ -206,6 +206,15 @@ def cmd_stats(args):
     out(args, st, f"{args.file}  {fmt_t(log.times[0])} -> {fmt_t(log.times[-1])}\n{text}")
 
 
+def is_noise(log: Log, c: Column) -> bool:
+    """Sensors that are settings, not readings, or known-broken (e.g. VRAM usage reading 100k+ MB)."""
+    if "Limit" in c.name and c.unit in ("\u00b0C", "W", "A"):
+        return True
+    if c.unit == "MB" and "Memory Usage" in c.name:
+        return max((v for v in log.data[c.index] if v == v), default=0) > 64000
+    return False
+
+
 def cmd_summary(args):
     log = load(args.file, date_order=args.date_order)
     names = []
@@ -217,9 +226,10 @@ def cmd_summary(args):
                 break
     med, gaps = interval_stats(log)
     head = f"{args.file}\n{fmt_t(log.times[0])} -> {fmt_t(log.times[-1])}  ({fmt_dur(log.times[-1] - log.times[0])}, {log.rows} rows, ~{med:g}s)"
-    names = [c for c in names if any(v == v and v != 0 for v in log.data[c.index])]  # drop idle (all-zero) sensors
+    names = [c for c in names if any(v == v and v != 0 for v in log.data[c.index])  # drop idle (all-zero) sensors
+             and not is_noise(log, c)]
     shown = {c.index for c in names}
-    hot = sorted((c for c in log.columns[2:] if c.unit == "\u00b0C" and c.index not in shown),
+    hot = sorted((c for c in log.columns[2:] if c.unit == "\u00b0C" and c.index not in shown and "Limit" not in c.name),
                  key=lambda c: -max((v for v in log.data[c.index] if v == v), default=-math.inf))
     names += hot[:EXTRA_HOTTEST]
     st, text = stats_table(log, names)
@@ -374,6 +384,117 @@ def cmd_compare(args):
         + table(rows, ["column", "avgA", "avgB", "d(avg)", "maxA", "maxB"]))
 
 
+def parse_run(spec: str) -> tuple[str, str, str | None]:
+    """[LABEL=]FILE[@START..END] -> (label, file, window)."""
+    label, eq, rest = spec.partition("=")
+    if not eq or "/" in label or "\\" in label or "." in label:
+        label, rest = "", spec
+    path, at, win = rest.rpartition("@")
+    if not at or ".." not in win:
+        path, win = rest, ""
+    return label or path.rsplit("/", 1)[-1], path, win or None
+
+
+def cmd_runs(args):
+    """N-way comparison: one table, one column per run (avg/max). Each run is [LABEL=]FILE[@START..END]."""
+    runs = [parse_run(r) for r in args.run]
+    cols = (args.column or []) + _when_cols(args.when)
+    loaded = []
+    for label, path, win in runs:
+        log = load(path, columns=cols, regex=args.regex, date_order=args.date_order)
+        loaded.append((label, log, select_rows(log, win, args.when)))
+    names = [c.name for c in loaded[0][1].find(args.column, args.regex) if c.index in loaded[0][1].data]
+    header = ["column"] + [f"{label} ({len(r)})" for label, _, r in loaded]
+    rows, res = [], []
+    for n in names:
+        row, per = [n], {}
+        for label, log, r in loaded:
+            col = next((c for c in log.columns if c.name == n and c.index in log.data), None)
+            st = col_stats(log, col, r) if col else {"n": 0}
+            per[label] = st
+            row.append(f"{fmt_v(st['avg'])}/{fmt_v(st['max'])}" if st.get("n") else "-")
+        rows.append(row)
+        res.append({"column": n, "runs": per})
+    note = f"avg/max per run; (n) = samples" + (f"; filtered by {args.when}" if args.when else "")
+    out(args, res, note + "\n" + table(rows, header))
+
+
+def _when_cols(when: str | None) -> list[str]:
+    m = re.match(r"^(.*?)\s*(?:>=|<=|>|<)", when) if when else None
+    return [m.group(1)] if m else []
+
+
+def cmd_hist(args):
+    """Time spent per value band for each chosen sensor (default bands: 5 equal ranges)."""
+    log = load(args.file, columns=args.column, regex=args.regex, date_order=args.date_order)
+    rows = select_rows(log, args.window, args.when)
+    dt = interval_stats(log)[0] or 1.0
+    blocks, res = [], []
+    for ci in log.data:
+        c = log.columns[ci]
+        vals = [log.data[ci][i] for i in rows if log.data[ci][i] == log.data[ci][i]]
+        if not vals:
+            continue
+        if args.edges:
+            edges = [float(x) for x in args.edges.split(",")]
+        else:
+            lo, hi = min(vals), max(vals)
+            step = (hi - lo) / args.bins or 1.0
+            edges = [lo + step * k for k in range(1, args.bins)]
+        bounds = [-math.inf] + edges + [math.inf]
+        counts = [0] * (len(bounds) - 1)
+        for v in vals:
+            for k in range(len(counts)):
+                if bounds[k] <= v < bounds[k + 1]:
+                    counts[k] += 1
+                    break
+        lines, items = [c.name], []
+        for k, n in enumerate(counts):
+            label = f"<{fmt_v(bounds[1])}" if k == 0 else f">={fmt_v(bounds[k])}" if k == len(counts) - 1 else f"{fmt_v(bounds[k])}-{fmt_v(bounds[k + 1])}"
+            pct = 100 * n / len(vals)
+            lines.append(f"  {label:>12}  {fmt_dur(n * dt):>9}  {pct:5.1f}%  " + "#" * round(pct / 4))
+            items.append({"band": label, "seconds": n * dt, "pct": pct})
+        blocks.append("\n".join(lines))
+        res.append({"column": c.name, "bands": items})
+    out(args, res, "\n\n".join(blocks))
+
+
+def cmd_corr(args):
+    """Which sensors move with a target sensor (Pearson r). Correlation is not causation."""
+    log = load(args.file, date_order=args.date_order)
+    tgt = log.find([args.target])
+    if not tgt:
+        raise ValueError(f"no column matches {args.target!r}")
+    tgt = tgt[0]
+    rows = select_rows(log, args.window, args.when)
+    y = [log.data[tgt.index][i] for i in rows]
+    ym = statistics.fmean(v for v in y if v == v)
+    yc = [(v - ym) if v == v else 0.0 for v in y]
+    yn = math.sqrt(sum(v * v for v in yc))
+    if yn == 0:
+        raise ValueError(f"{tgt.name} is constant over the selected samples")
+    res = []
+    for ci, vals in log.data.items():
+        if ci == tgt.index or log.columns[ci].is_flag:
+            continue
+        x = [vals[i] for i in rows]
+        good = [v for v in x if v == v]
+        if len(good) < 0.95 * len(x) or max(good) == min(good):
+            continue
+        xm = statistics.fmean(good)
+        xc = [(v - xm) if v == v else 0.0 for v in x]
+        xn = math.sqrt(sum(v * v for v in xc))
+        r = sum(a * b for a, b in zip(xc, yc)) / (xn * yn)
+        if abs(r) >= 0.985 and not args.all:
+            continue  # near-duplicates of the target (same sensor via another view)
+        res.append((r, log.columns[ci]))
+    res.sort(key=lambda t: -abs(t[0]))
+    top = res[:args.top]
+    text = f"correlation with {tgt.name} over {len(rows)} samples (association, not cause)\n" + table(
+        [[c.name, c.unit, f"{r:+.2f}"] for r, c in top], ["sensor", "unit", "r"])
+    out(args, [{"column": c.name, "r": r} for r, c in top], text)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="hwlog", description=__doc__)
     p.add_argument("--json", action="store_true", help="machine-readable output")
@@ -409,6 +530,15 @@ def main(argv=None):
     s.add_argument("--window-a", metavar="START..END", help="restrict A, e.g. 20:15..21:02 or +0..+600")
     s.add_argument("--window-b", metavar="START..END", help="restrict B (or the second window when B is omitted)")
     s.add_argument("--when", metavar="COL>=VALUE", help="only samples where a condition holds on each side, e.g. 'GPU Utilization>=90'")
+
+    s = add("runs", cmd_runs, "N-way table: one column per run, each [LABEL=]FILE[@START..END]")
+    s.add_argument("run", nargs="+"); colopts(s, True)
+    s.add_argument("--when", metavar="COL>=VALUE", help="only samples where a condition holds in every run")
+    s = add("hist", cmd_hist, "time spent per value band (e.g. how long above 80 C)"); s.add_argument("file"); colopts(s, True)
+    s.add_argument("--bins", type=int, default=5); s.add_argument("--edges", help="comma-separated band edges, e.g. 70,80,85,90")
+    s.add_argument("--window", metavar="START..END"); s.add_argument("--when", metavar="COL>=VALUE")
+    s = add("corr", cmd_corr, "sensors that move with a target sensor"); s.add_argument("file"); s.add_argument("target")
+    s.add_argument("--top", type=int, default=12); s.add_argument("--all", action="store_true", help="include near-duplicate sensors (|r|>=0.985)"); s.add_argument("--window", metavar="START..END"); s.add_argument("--when", metavar="COL>=VALUE")
 
     args = p.parse_args(argv)
     try:

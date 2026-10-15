@@ -21,6 +21,10 @@ Run `hwlog ...` if installed (`pip install git+https://github.com/ApoloxDragon/h
 7. `hwlog compare A B -c ...` - two logs. One log, two windows: `hwlog compare FILE --window-a 20:15..21:02 --window-b 21:05..21:13 -c ...`
    `--when "GPU Utilization>=90"` keeps only samples at matching load.
 
+8. `hwlog runs "60%=A.CSV@22:00..23:10" "90%=B.CSV@20:15..21:02" -c "Hot Spot" -c "Fan PWM"` - N runs/windows side by side (avg/max).
+9. `hwlog hist FILE -c "Hot Spot" --edges 70,80,85,90 [--window ..]` - time spent in each band ("how long above 85?").
+10. `hwlog corr FILE "GPU Hot Spot Temperature" --top 10` - sensors that move with a target (association, not cause).
+
 `-c` takes a name substring, exact name or column index (repeatable). Duplicate names get `#2`, `#3`. Windows are `START..END`
 (`HH:MM[:SS]` or `+seconds`). `--json` (before the subcommand) gives machine-readable output.
 
