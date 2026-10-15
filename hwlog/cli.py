@@ -130,8 +130,11 @@ def cmd_info(args):
         lines = [f"{path}", f"  {info['start']} -> {info['end']}  ({fmt_dur(info['duration_s'])}, {log.rows} rows, ~{med:g}s interval, {info['columns']} sensors)"]
         if gaps:
             lines.append("  gaps: " + ", ".join(f"{fmt_t(t, True)} (+{g:.0f}s)" for t, g in gaps[:8]) + (" ..." if len(gaps) > 8 else ""))
-        lines.append("  sensor groups:")
-        lines += [f"    {n:4d}  {g}" for g, n in groups.items()]
+        if set(groups) == {"(unknown)"}:
+            lines.append(f"  sensor groups: unavailable ({groups['(unknown)']} sensors; file has no footer, so HWiNFO was likely still logging when it was copied)")
+        else:
+            lines.append("  sensor groups:")
+            lines += [f"    {n:4d}  {g}" for g, n in groups.items()]
         out(args, info, "\n".join(lines))
 
 
